@@ -7,11 +7,11 @@
 
 // This structure is intentionally sized as 24 bytes so that the 8 more bytes
 // from the chunk header will put the user data on a 16 byte alignment.
-struct segment {
+typedef struct Segment_ {
     size_t size;
-    struct segment *next;
+    struct Segment_ *next;
     size_t null_header;
-};
+} Segment;
 
 /*
  * Chunk header/footer:
@@ -21,28 +21,42 @@ struct segment {
  * 4 bits: top 3 unused, lowest = !is_free(this_chunk)
  */
 
-static struct segment *head = NULL;
+void allocator_init(Allocator *allocator) {
+    allocator->head = NULL;
+}
 
-static void new_segment(size_t seg_size) {
-    struct segment *segment = mmap(NULL, seg_size, PROT_READ | PROT_WRITE,
+void allocator_deinit(Allocator *allocator) {
+    Segment *segment = allocator->head;
+
+    while (segment) {
+        Segment *next = segment->next;
+
+        munmap(segment, segment->size);
+
+        segment = next;
+    }
+}
+
+static void new_segment(Allocator *allocator, size_t seg_size) {
+    Segment *segment = mmap(NULL, seg_size, PROT_READ | PROT_WRITE,
                                    MAP_ANON | MAP_PRIVATE, -1, 0);
     segment->size = seg_size;
-    segment->next = head;
+    segment->next = allocator->head;
     // segment->null_header = 0;
     // ^^^ automatically nulled out by mmap b/c MAP_ANON
-    head = segment;
+    allocator->head = segment;
 }
 
 // pre: size is 16-byte aligned.
-static void *allocate_in_new_segment(size_t size) {
+static void *allocate_in_new_segment(Allocator *allocator, size_t size) {
     size_t chunk_size = size + 2 * sizeof(size_t);
-    size_t data_size = sizeof(struct segment) + chunk_size;
+    size_t data_size = sizeof(Segment) + chunk_size;
     size_t total_size =
         data_size +
         sizeof(size_t); // make sure we have space to store a null chunk
     size_t seg_size = total_size + 4095 & ~4095;
-    new_segment(seg_size);
-    size_t *chunk_header = (void *)(head + 1);
+    new_segment(allocator, seg_size);
+    size_t *chunk_header = (void *)(allocator->head + 1);
     *chunk_header = chunk_size | 1; // or with 1 for in use.
 
     void *userdata = chunk_header + 1;
@@ -66,8 +80,8 @@ static void *allocate_in_new_segment(size_t size) {
 // return: the first free chunk having at least size bytes of userdata space.
 // NULL if no such chunk exists.
 // if head is NULL, returns NULL
-static void *find_chunk_of_min_size(size_t size) {
-    struct segment *segment = head;
+static void *find_chunk_of_min_size(Allocator allocator, size_t size) {
+    Segment *segment = allocator.head;
 
     while (segment) {
         size_t *chunk_header = (void *)(segment + 1);
@@ -90,8 +104,8 @@ static void *find_chunk_of_min_size(size_t size) {
     return NULL;
 }
 
-void debug_print_heap() {
-    struct segment *segment = head;
+void debug_print_heap(Allocator allocator) {
+    Segment *segment = allocator.head;
 
     fputs("--------------------\n", stderr);
 
@@ -113,13 +127,13 @@ void debug_print_heap() {
     fputs("--------------------\n", stderr);
 }
 
-void *allocate_memory(size_t size) {
+void *allocate_memory(Allocator *allocator, size_t size) {
     size = size + 15 & ~15;
 
-    void *chunk = find_chunk_of_min_size(size);
+    void *chunk = find_chunk_of_min_size(*allocator, size);
 
     if (!chunk) {
-        return allocate_in_new_segment(size);
+        return allocate_in_new_segment(allocator, size);
     }
 
     size_t *chunk_header = chunk;
@@ -145,16 +159,30 @@ void *allocate_memory(size_t size) {
     return chunk_header + 1;
 }
 
-void free_memory(void *ptr) {
-    if (!ptr) {
-        return;
+void consolidate_rightward(size_t *chunk_header) {
+    size_t in_use = *chunk_header & 1;
+    size_t chunk_size = *chunk_header ^ in_use;
+    size_t *next_header = (void *)chunk_header + chunk_size;
+
+    while (*next_header && (*next_header & 1) == 0) {
+        chunk_size += *next_header;
+        next_header = (void *)next_header + *next_header;
     }
 
-    size_t *chunk_header = ptr - sizeof(size_t);
-    *chunk_header &= ~1;
-    size_t *prev_footer = chunk_header - 1;
+    *chunk_header = chunk_size | in_use;
+
+    size_t *chunk_footer = (void *)chunk_header + chunk_size - sizeof(size_t);
+    *chunk_footer = chunk_size;
+}
+
+size_t *consolidate_leftward(size_t *chunk_header) {
+    size_t in_use = *chunk_header & 1;
+    size_t chunk_size = *chunk_header ^ in_use;
+
     size_t *new_header = chunk_header;
 
+    size_t *prev_footer = chunk_header - 1;
+    size_t *chunk_footer = (void *)prev_footer + chunk_size;
     while (*prev_footer) {
         size_t *prev_header =
             (void *)prev_footer - *prev_footer + sizeof(size_t);
@@ -163,32 +191,30 @@ void free_memory(void *ptr) {
             break;
         }
 
+        chunk_size += *prev_footer;
         new_header = prev_header;
-        prev_footer = new_header - 1;
+        prev_footer = prev_header - 1;
     }
 
-    size_t *new_footer = (void *)chunk_header + *chunk_header - sizeof(size_t);
-    size_t *next_header = new_footer + 1;
-    while (*next_header) {
-        if (*next_header & 1) {
-            break;
-        }
+    *new_header = chunk_size | in_use;
+    *chunk_footer = chunk_size;
 
-        next_header = (void *)next_header + *next_header;
-        size_t *next_footer = (void *)next_header - sizeof(size_t);
+    return new_header;
+}
 
-        new_footer = next_footer;
-    }
-
-    *new_header = (void *)new_footer - (void *)new_header + sizeof(size_t);
-    *new_footer = *new_header;
+void free_chunk(Allocator *allocator, size_t *chunk_header) {
+    *chunk_header &= ~1;
+    consolidate_rightward(chunk_header);
+    chunk_header = consolidate_leftward(chunk_header);
+    size_t *prev_footer = chunk_header - 1;
+    size_t *next_header = (void *)chunk_header + *chunk_header;
 
     // We've reclaimed the entire segment, so remove it from the segment list
     // and unmap it.
     if (!*prev_footer && !*next_header) {
-        struct segment *segment = (void *)new_header - sizeof(struct segment);
+        Segment *segment = (void *)chunk_header - sizeof(struct Segment_);
 
-        struct segment **node = &head;
+        Segment **node = &allocator->head;
 
         while (*node != segment) {
             node = &(*node)->next;
@@ -200,16 +226,73 @@ void free_memory(void *ptr) {
     }
 }
 
-void *reallocate_memory(void *ptr, size_t new_size) {
-    new_size = new_size + 15 & ~15;
-    // first, if new_size is smaller than size, check if there'd be enough space
-    // left over to split this chunk. if so, split the chunk to the right.
-    // second, if new_size is greater than size, see how large we can make the
-    // chunk by consolidating the chunks on the right side. If the amount of
-    // space in the new (consolidated) chunk exceeds or matches new_size, then
-    // we've successfully extended the allocation. If it doesn't, free and
-    // allocate again. make an impl method consolidate_rightward(size_t
-    // *chunk_header), consolidate_leftward(size_t *chunk_header),
-    // free_chunk(size_t *chunk_header);
-    return NULL;
+void free_memory(Allocator *allocator, void *ptr) {
+    if (!ptr) {
+        return;
+    }
+
+    size_t *chunk_header = ptr - sizeof(size_t);
+    free_chunk(allocator, chunk_header);
+}
+
+void *reallocate_memory(Allocator *allocator, void *ptr, size_t new_size) {
+    if (!ptr) {
+        return allocate_memory(allocator, new_size);
+    }
+
+    size_t data_size = new_size + 15 & ~15;
+    size_t new_chunk_size = data_size + 2 * sizeof(size_t);
+    size_t *chunk_header = ptr - sizeof(size_t);
+    size_t old_chunk_size = (*chunk_header & ~1);
+
+    size_t excess;
+
+    if (new_chunk_size == old_chunk_size) {
+        return ptr;
+    } else if (new_chunk_size > old_chunk_size) {
+        // consolidate memory rightward.
+        // chunk_header stays in place during this operation.
+        size_t accumulated_size = old_chunk_size;
+
+        size_t *next_header = (void *)chunk_header + accumulated_size;
+
+        while (accumulated_size < new_chunk_size && *next_header &&
+               (*next_header & 1) == 0) {
+            accumulated_size += *next_header;
+            next_header = (void *)next_header + *next_header;
+        }
+
+        size_t *chunk_footer =
+            (void *)chunk_header + accumulated_size - sizeof(size_t);
+        *chunk_header = accumulated_size | 1;
+        *chunk_footer = accumulated_size;
+
+        if (accumulated_size < new_chunk_size) {
+            free_chunk(allocator, chunk_header);
+            return allocate_memory(allocator, new_size);
+        }
+
+        excess = accumulated_size - new_chunk_size;
+    } else {
+        // new_chunk_size < old_chunk_size
+        excess = old_chunk_size - new_chunk_size;
+    }
+
+    // either new_chunk_size < old_chunk_size OR we successfully consolidated
+    // rightward.
+
+    if (excess > 2 * sizeof(size_t)) {
+        *chunk_header = new_chunk_size | 1;
+        size_t *chunk_footer =
+            (void *)chunk_header + new_chunk_size - sizeof(size_t);
+        *chunk_footer = new_chunk_size;
+
+        size_t *new_header = (void *)chunk_header + new_chunk_size;
+        *new_header = excess;
+
+        size_t *new_footer = (void *)chunk_footer + new_chunk_size;
+        *new_footer = excess;
+    }
+
+    return chunk_header + 1;
 }
