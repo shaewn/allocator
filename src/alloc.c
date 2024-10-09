@@ -110,7 +110,7 @@ void debug_print_heap(Allocator allocator) {
     fputs("--------------------\n", stderr);
 
     while (segment) {
-        fprintf(stderr, "SEGMENT %p\n", segment);
+        fprintf(stderr, "SEGMENT %p of size %zu\n", segment, segment->size);
 
         size_t *chunk_header = (void *)(segment + 1);
 
